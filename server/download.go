@@ -43,7 +43,8 @@ type blobDownload struct {
 	Total     int64
 	Completed atomic.Int64
 
-	Parts []*blobDownloadPart
+	MPTotalParts int
+	Parts        []*blobDownloadPart
 
 	context.CancelFunc
 
@@ -52,11 +53,17 @@ type blobDownload struct {
 	references atomic.Int32
 }
 
+func newBlobDownload(name string, digest string) *blobDownload {
+	return &blobDownload{Name: name, Digest: digest, MPTotalParts: 0}
+}
+
 type blobDownloadPart struct {
-	N           int
-	Offset      int64
-	Size        int64
-	Completed   int64
+	N         int
+	Offset    int64
+	Size      int64
+	Completed int64
+
+	mp          bool
 	lastUpdated time.Time
 
 	*blobDownload `json:"-"`
@@ -83,6 +90,10 @@ func (p *blobDownloadPart) Write(b []byte) (n int, err error) {
 	return n, nil
 }
 
+func (b *blobDownloadPart) isMultipart() bool {
+	return b.mp
+}
+
 func (b *blobDownload) Prepare(ctx context.Context, requestURL *url.URL, opts *registryOptions) error {
 	partFilePaths, err := filepath.Glob(b.Name + "-partial-*")
 	if err != nil {
@@ -101,13 +112,22 @@ func (b *blobDownload) Prepare(ctx context.Context, requestURL *url.URL, opts *r
 	}
 
 	if len(b.Parts) == 0 {
-		resp, err := makeRequestWithRetry(ctx, http.MethodHead, requestURL, nil, nil, opts)
+		headers := http.Header{}
+		resp, err := makeRequestWithRetry(ctx, http.MethodHead, requestURL, headers, nil, opts)
 		if err != nil {
 			return err
 		}
 		defer resp.Body.Close()
 
-		b.Total, _ = strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+		const msg = "object response: %s, headers: %+s"
+		slog.Info(fmt.Sprintf(msg, resp.Status, resp.Header))
+
+		// Branch to an S3-compatible multipart download if available.
+		b.MPTotalParts = parseInt(resp.Header.Get("X-Amz-Mp-Parts-Count"), 0)
+		b.Total = parseInt(resp.Header.Get("Content-Length"), int64(0))
+		if false {
+			return b.prepareMultiPart(ctx, requestURL, opts)
+		}
 
 		size := b.Total / int64(numDownloadParts)
 		switch {
@@ -155,7 +175,7 @@ func (b *blobDownload) run(ctx context.Context, requestURL *url.URL, opts *regis
 	g.SetLimit(numDownloadParts)
 	for i := range b.Parts {
 		part := b.Parts[i]
-		if part.Completed == part.Size {
+		if !part.isMultipart() && part.Completed == part.Size {
 			continue
 		}
 
@@ -219,6 +239,9 @@ func (b *blobDownload) downloadChunk(ctx context.Context, requestURL *url.URL, w
 		}
 		defer resp.Body.Close()
 
+		const msg = "%s part %d response headers: %+s"
+		slog.Info(fmt.Sprintf(msg, b.Digest[7:19], part.N, resp.Header))
+
 		n, err := io.Copy(w, io.TeeReader(resp.Body, part))
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.ErrUnexpectedEOF) {
 			// rollback progress
@@ -260,13 +283,67 @@ func (b *blobDownload) downloadChunk(ctx context.Context, requestURL *url.URL, w
 	return g.Wait()
 }
 
-func (b *blobDownload) newPart(offset, size int64) error {
-	part := blobDownloadPart{blobDownload: b, Offset: offset, Size: size, N: len(b.Parts)}
-	if err := b.writePart(part.Name(), &part); err != nil {
+func (b *blobDownload) isMultipart() bool {
+	return b.MPTotalParts > 0
+}
+
+func (b *blobDownload) prepareMultiPart(ctx context.Context, requestURL *url.URL, opts *registryOptions) (err error) {
+	// partNumber can be used to specify retrieving a specific part
+	// X-Amz-Checksum-Mode=ENABLED can be used to retrieve the checksum
+	for i := 0; i < b.MPTotalParts; i++ {
+		if err := b.newMultiPart(i); err != nil {
+			return err
+		}
+	}
+	eg, ctx := errgroup.WithContext(ctx)
+	for _, p := range b.Parts {
+		p := p
+		eg.Go(func() error {
+			return p.fillMultiPartMetadata(ctx, requestURL, opts)
+		})
+	}
+	if err := eg.Wait(); err != nil {
 		return err
 	}
 
-	b.Parts = append(b.Parts, &part)
+	slog.Info(fmt.Sprintf("downloading multipart %s in %d part(s)", b.Digest[7:19], len(b.Parts)))
+	return errors.New("not implemented")
+}
+
+func (b *blobDownload) newPart(offset, size int64) error {
+	part := &blobDownloadPart{blobDownload: b, Offset: offset, Size: size, N: len(b.Parts)}
+	if err := b.writePart(part.Name(), part); err != nil {
+		return err
+	}
+	b.Parts = append(b.Parts, part)
+	return nil
+}
+
+func (p *blobDownloadPart) fillMultiPartMetadata(ctx context.Context, requestURL *url.URL, opts *registryOptions) error {
+	// Get the header information about the part
+	u, _ := url.Parse(requestURL.String())
+	q := u.Query()
+	q.Add("partNumber", fmt.Sprintf("%d", p.N))
+	u.RawQuery = q.Encode()
+	resp, err := makeRequestWithRetry(ctx, http.MethodHead, u, nil, nil, opts)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	const msg = "part %2d url: %s, response: %s, headers: %+s"
+	slog.Info(fmt.Sprintf(msg, p.N, u.String(), resp.Status, resp.Header))
+	return nil
+}
+
+func (b *blobDownload) newMultiPart(n int) error {
+	// Create the part
+	part := &blobDownloadPart{blobDownload: b, N: n, mp: true}
+	if err := b.writePart(part.Name(), part); err != nil {
+		return err
+	}
+
+	b.Parts = append(b.Parts, part)
 	return nil
 }
 
@@ -360,7 +437,7 @@ func downloadBlob(ctx context.Context, opts downloadOpts) error {
 		return nil
 	}
 
-	data, ok := blobDownloadManager.LoadOrStore(opts.digest, &blobDownload{Name: fp, Digest: opts.digest})
+	data, ok := blobDownloadManager.LoadOrStore(opts.digest, newBlobDownload(fp, opts.digest))
 	download := data.(*blobDownload)
 	if !ok {
 		requestURL := opts.mp.BaseURL()
