@@ -1,6 +1,7 @@
 package mlxrunner
 
 import (
+	"math"
 	"slices"
 	"testing"
 	"time"
@@ -1408,4 +1409,52 @@ func TestMergeWithChildSkipsStatelessLayers(t *testing.T) {
 			t.Fatalf("stateful layer %d lost its merged snapshot", i)
 		}
 	}
+}
+
+// TestZeroPromptCacheKeepsOnlyActiveConversation verifies that a zero budget
+// evicts other conversations' snapshots while the active one survives.
+func TestZeroPromptCacheKeepsOnlyActiveConversation(t *testing.T) {
+	t.Cleanup(func(old int64) func() {
+		return func() { maxPagedOutBytes = old }
+	}(maxPagedOutBytes))
+	setPromptCacheBudget(-1)
+	if maxPagedOutBytes != math.MaxInt64 {
+		t.Fatalf("setPromptCacheBudget(-1): maxPagedOutBytes = %d, want unlimited", maxPagedOutBytes)
+	}
+	setPromptCacheBudget(0)
+
+	forEachEnv(t, func(t *testing.T, env *testEnv) {
+		pc := env.pc
+		for i := range 3 {
+			inputs := []int32{int32(100 + i*10), int32(101 + i*10), int32(102 + i*10)}
+			simulateRequest(t, pc, inputs, []int32{int32(200 + i)})
+		}
+
+		walkNodes(pc.root, func(n *trieNode) bool {
+			if !n.hasSnapshots() {
+				return true
+			}
+			snaps := make([]cache.Snapshot, len(n.snapshots))
+			for i, s := range n.snapshots {
+				if s != nil {
+					snaps[i] = &fakeSnapshot{byteSize: 1024}
+				}
+			}
+			n.setSnapshots(snaps, &pc.pagedOutBytes)
+			return true
+		})
+		pc.enforceEvictionPolicy()
+
+		walkNodes(pc.root, func(n *trieNode) bool {
+			if n.hasSnapshots() && !slices.Contains(pc.activePath, n) {
+				t.Fatalf("node [%d,%d) off the active path kept its snapshots", n.startOffset(), n.endOffset)
+			}
+			return true
+		})
+		if _, matched := findBestMatch(pc.root, pc.key(effectiveKeyTokens([]int32{100, 101, 102}, nil))); matched != 0 {
+			t.Fatalf("evicted conversation still matches %d tokens", matched)
+		}
+
+		checkTrieInvariants(t, pc.root)
+	})
 }

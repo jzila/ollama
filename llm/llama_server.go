@@ -408,6 +408,7 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		params = append(params, "-np", "16", "--kv-unified", "--cache-ram", "0")
 	} else {
 		params = append(params, "-np", strconv.Itoa(launch.numParallel))
+		params = appendPromptCacheArgs(params, launch.opts)
 	}
 	params = appendLlamaServerLogArgs(params)
 	params = appendJinjaArgs(params, launch.config)
@@ -607,6 +608,15 @@ func embeddingBatchSize(opts api.Options, numParallel int) int {
 		batchSize = min(batchSize, opts.NumCtx*max(numParallel, 1))
 	}
 	return batchSize
+}
+
+// appendPromptCacheArgs sets the host-memory prompt cache budget when the
+// model sets prompt_cache. When unset, llama-server keeps its own default.
+func appendPromptCacheArgs(params []string, opts api.Options) []string {
+	if opts.PromptCache == nil {
+		return params
+	}
+	return append(params, "--cache-ram", strconv.Itoa(*opts.PromptCache))
 }
 
 func appendLlamaServerLogArgs(params []string) []string {

@@ -599,6 +599,7 @@ type Runner struct {
 	UseMMap         *bool `json:"use_mmap,omitempty"`
 	NumThread       int   `json:"num_thread,omitempty"`
 	DraftNumPredict int   `json:"draft_num_predict,omitempty"`
+	PromptCache     *int  `json:"prompt_cache,omitempty"` // MiB of prompt cache kept across requests; nil uses the runner default
 }
 
 // SystemOneRequest is the request passed to [Client.SystemOne]. It asks a

@@ -32,6 +32,7 @@ import (
 	"cmp"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"time"
 
@@ -42,7 +43,20 @@ import (
 
 const prefillSnapshotInterval = 8192
 
-const maxPagedOutBytes int64 = 8 << 30 // 8 GiB eviction threshold for paged-out snapshot memory
+// maxPagedOutBytes is the eviction threshold for paged-out snapshot memory.
+// A runner serves one model, whose prompt_cache option may override it.
+var maxPagedOutBytes int64 = 8 << 30 // 8 GiB
+
+// setPromptCacheBudget sets maxPagedOutBytes from a prompt_cache budget in
+// MiB. Zero keeps only the most recent conversation; a negative budget
+// has no limit, as with llama-server's --cache-ram.
+func setPromptCacheBudget(mib int) {
+	if mib < 0 {
+		maxPagedOutBytes = math.MaxInt64
+		return
+	}
+	maxPagedOutBytes = int64(mib) << 20
+}
 
 type prefixCache struct {
 	root          *trieNode   // root of the prefix trie
