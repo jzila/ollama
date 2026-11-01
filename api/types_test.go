@@ -302,6 +302,12 @@ func TestMainGPUFormatParams(t *testing.T) {
 	assert.Equal(t, int64(0), resp["main_gpu"])
 }
 
+func TestPromptCacheRejectsNegativeBudgets(t *testing.T) {
+	opts := DefaultOptions()
+	require.NoError(t, opts.FromMap(map[string]any{"prompt_cache": float64(-1)}))
+	require.Error(t, opts.FromMap(map[string]any{"prompt_cache": float64(-2)}))
+}
+
 func TestMessage_UnmarshalJSON(t *testing.T) {
 	tests := []struct {
 		input    string

@@ -1213,6 +1213,10 @@ func (opts *Options) FromMap(m map[string]any) error {
 		}
 	}
 
+	if opts.PromptCache != nil && *opts.PromptCache < -1 {
+		return fmt.Errorf("option %q must be -1 (unlimited), 0 (off) or a budget in MiB", "prompt_cache")
+	}
+
 	return nil
 }
 
